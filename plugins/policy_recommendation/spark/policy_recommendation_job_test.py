@@ -12,14 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import pytest
 import random
+import sys
 import yaml
 import kubernetes.client
 
 from pyspark.sql import SparkSession, Row
 
-import antrea_crd
+sys.path.append(os.path.join(os.path.dirname(__file__)))
+parent_folder = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parent_folder)
+
+import common.antrea_crd as antrea_crd
+
 import policy_recommendation_job as pr
 
 

@@ -30,8 +30,18 @@ from pyspark.sql.functions import udf
 from pyspark.sql.types import StringType
 from urllib.parse import urlparse
 
-import antrea_crd
-from policy_recommendation_utils import (
+parent_folder = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parent_folder)
+
+import common.antrea_crd as antrea_crd
+from common.processing import get_flow_type, get_protocol_string
+from common.policy_recommendation import (
+    recommend_policies_for_ns_allow_list,
+    generate_reject_acnp,
+    reject_all_acnp
+)
+
+from common.utils import (
     is_intstring,
     get_IP_version,
     dict_to_yaml,
@@ -74,17 +84,6 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 
 
-def get_flow_type(flowType, destinationServicePortName, destinationPodLabels):
-    if flowType == 3:
-        return "pod_to_external"
-    elif destinationServicePortName != "":
-        return "pod_to_svc"
-    elif destinationPodLabels != "":
-        return "pod_to_pod"
-    else:
-        return "pod_to_external"
-
-
 def remove_meaningless_labels(podLabels):
     try:
         labels_dict = json.loads(podLabels)
@@ -99,15 +98,6 @@ def remove_meaningless_labels(podLabels):
         if key not in MEANINGLESS_LABELS
     }
     return json.dumps(labels_dict, sort_keys=True)
-
-
-def get_protocol_string(protocolIdentifier):
-    if protocolIdentifier == 6:
-        return "TCP"
-    elif protocolIdentifier == 17:
-        return "UDP"
-    else:
-        return "UNKNOWN"
 
 
 def map_flow_to_egress(flow, k8s=False):
@@ -527,70 +517,6 @@ def generate_svc_acnp(x):
         return []
 
 
-def generate_reject_acnp(applied_to):
-    if not applied_to:
-        np_name = "recommend-reject-all-acnp"
-        applied_to = antrea_crd.NetworkPolicyPeer(
-            pod_selector=kubernetes.client.V1LabelSelector(),
-            namespace_selector=kubernetes.client.V1LabelSelector(),
-        )
-    else:
-        np_name = generate_policy_name("recommend-reject-acnp")
-        ns, labels = applied_to.split(ROW_DELIMITER)
-        if ns in NAMESPACE_ALLOW_LIST:
-            return []
-        try:
-            labels_dict = json.loads(labels)
-        except Exception as e:
-            logger.error(
-                "Error {}: labels {} in applied_to {} are not in json format"
-                .format(
-                    e, labels, applied_to
-                )
-            )
-            return []
-        applied_to = antrea_crd.NetworkPolicyPeer(
-            pod_selector=kubernetes.client.V1LabelSelector(
-                match_labels=labels_dict
-            ),
-            namespace_selector=kubernetes.client.V1LabelSelector(
-                match_labels={"kubernetes.io/metadata.name": ns}
-            ),
-        )
-    np = antrea_crd.ClusterNetworkPolicy(
-        kind="ClusterNetworkPolicy",
-        api_version="crd.antrea.io/v1alpha1",
-        metadata=kubernetes.client.V1ObjectMeta(
-            name=np_name,
-        ),
-        spec=antrea_crd.NetworkPolicySpec(
-            tier="Baseline",
-            priority=DEFAULT_POLICY_PRIORITY,
-            applied_to=[applied_to],
-            egress=[
-                antrea_crd.Rule(
-                    action="Reject",
-                    to=[
-                        antrea_crd.NetworkPolicyPeer(
-                            pod_selector=kubernetes.client.V1LabelSelector()
-                        )
-                    ],
-                )
-            ],
-            ingress=[
-                antrea_crd.Rule(
-                    action="Reject",
-                    _from=[
-                        antrea_crd.NetworkPolicyPeer(
-                            pod_selector=kubernetes.client.V1LabelSelector()
-                        )
-                    ],
-                )
-            ],
-        ),
-    )
-    return [dict_to_yaml(np.to_dict())]
-
 
 def recommend_k8s_policies(flows_df):
     egress_rdd = flows_df.rdd.map(
@@ -667,7 +593,7 @@ def recommend_antrea_policies(
             return anp_list + svc_cg_list + svc_acnp_list + deny_anp_list
         else:
             # Recommend deny ACNP for whole cluster
-            deny_all_policy = generate_reject_acnp("")
+            deny_all_policy = reject_all_acnp()
             return anp_list + svc_cg_list + svc_acnp_list + [deny_all_policy]
     else:
         return anp_list + svc_cg_list + svc_acnp_list
@@ -694,54 +620,6 @@ def recommend_policies_for_trusted_denied_flows(
     return recommend_antrea_policies(
         trusted_denied_flows_df, deny_rules=False, to_services=to_services
     )
-
-
-def recommend_policies_for_ns_allow_list(ns_allow_list):
-    policies = []
-    for ns in ns_allow_list:
-        np_name = generate_policy_name("recommend-allow-acnp-{}".format(ns))
-        acnp = antrea_crd.ClusterNetworkPolicy(
-            kind="ClusterNetworkPolicy",
-            api_version="crd.antrea.io/v1alpha1",
-            metadata=kubernetes.client.V1ObjectMeta(
-                name=np_name,
-            ),
-            spec=antrea_crd.NetworkPolicySpec(
-                tier="Platform",
-                priority=DEFAULT_POLICY_PRIORITY,
-                applied_to=[
-                    antrea_crd.NetworkPolicyPeer(
-                        namespace_selector=kubernetes.client.V1LabelSelector(
-                            match_labels={"kubernetes.io/metadata.name": ns}
-                        )
-                    )
-                ],
-                egress=[
-                    antrea_crd.Rule(
-                        action="Allow",
-                        to=[
-                            antrea_crd.NetworkPolicyPeer(
-                                pod_selector=kubernetes.client
-                                .V1LabelSelector()
-                            )
-                        ],
-                    )
-                ],
-                ingress=[
-                    antrea_crd.Rule(
-                        action="Allow",
-                        _from=[
-                            antrea_crd.NetworkPolicyPeer(
-                                pod_selector=kubernetes.client
-                                .V1LabelSelector()
-                            )
-                        ],
-                    )
-                ],
-            ),
-        )
-        policies.append(dict_to_yaml(acnp.to_dict()))
-    return policies
 
 
 def generate_sql_query(table_name, limit, start_time, end_time, unprotected):
